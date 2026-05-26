@@ -1,8 +1,10 @@
 // =============================================================================
-// server.cpp - CORRECTED VERSION
-// Multi-client TCP server for the Vector Database Engine (Phase 1+2+3)
+// server.cpp - PHASE 2 FIXED VERSION
+// Multi-client TCP server for the Vector Database Engine
 //
-// Protocol responses now match manual Section 3 exactly
+// KEY FIXES:
+// 1. Flush after EVERY send_line() to prevent buffering issues
+// 2. STATS now properly outputs cluster sizes
 // =============================================================================
 
 #include <iostream>
@@ -16,6 +18,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <iomanip>
+#include <chrono>
 
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -38,10 +41,12 @@ static std::atomic<int>   g_client_count{0};
 
 // ---------------------------------------------------------------------------
 // send_line: write a response string followed by '\n' to a socket fd.
+// IMPORTANT: Always flush stdout to prevent buffering issues
 // ---------------------------------------------------------------------------
 static bool send_line(int fd, const std::string& msg) {
     std::string out = msg + "\n";
     ssize_t sent = send(fd, out.c_str(), out.size(), MSG_NOSIGNAL);
+    std::cout.flush();  // ← KEY FIX: Flush immediately
     return sent == (ssize_t)out.size();
 }
 
@@ -86,30 +91,29 @@ static void handle_client(int client_fd, std::string peer_addr) {
                 goto disconnect;
 
             case CommandType::STATS: {
-                std::lock_guard<std::mutex> lock(g_mutex);
-                
-                std::ostringstream oss;
-                oss << "dimension : " << g_store->dim() << "\n"
-                    << "total vectors : " << g_store->size() << "\n";
-                
-                if (g_ivf->is_built()) {
-                    oss << "index built : yes\n"
-                        << "clusters : " << g_ivf->num_clusters() << "\n"
-                        << "cluster sizes : ";
-                    
-                    // Get cluster sizes
-                    const auto& clusters = g_ivf->get_clusters();
-                    for (size_t i = 0; i < clusters.size(); ++i) {
-                        if (i > 0) oss << " , ";
-                        oss << clusters[i].size();
-                    }
-                } else {
-                    oss << "index built : no";
-                }
-                
-                send_line(client_fd, oss.str());
-                break;
-            }
+    std::lock_guard<std::mutex> lock(g_mutex);
+    
+    send_line(client_fd, std::string("dimension : ") + std::to_string(g_store->dim()));
+    send_line(client_fd, std::string("total vectors : ") + std::to_string(g_store->size()));
+    
+    if (g_ivf->is_built()) {
+        send_line(client_fd, "index built : yes");
+        send_line(client_fd, std::string("clusters : ") + std::to_string(g_ivf->num_clusters()));
+        
+        std::ostringstream cluster_sizes;
+        cluster_sizes << "cluster sizes : ";
+        
+        const auto& clusters = g_ivf->get_clusters();
+        for (size_t i = 0; i < clusters.size(); ++i) {
+            if (i > 0) cluster_sizes << " , ";
+            cluster_sizes << clusters[i].size();
+        }
+        send_line(client_fd, cluster_sizes.str());
+    } else {
+        send_line(client_fd, "index built : no");
+    }
+    break;
+}
 
             case CommandType::ADD: {
                 std::lock_guard<std::mutex> lock(g_mutex);
@@ -126,39 +130,45 @@ static void handle_client(int client_fd, std::string peer_addr) {
             }
 
             case CommandType::BUILD: {
-                send_line(client_fd, "Building IVF index ...");
-                
-                std::string summary;
-                int vectors_count, clusters_count;
-                double build_time_s;
-                
-                {
-                    std::lock_guard<std::mutex> lock(g_mutex);
-                    try {
-                        auto t_start = std::chrono::high_resolution_clock::now();
-                        summary = g_ivf->build(*g_store);
-                        auto t_end = std::chrono::high_resolution_clock::now();
-                        
-                        build_time_s = std::chrono::duration<double>(t_end - t_start).count();
-                        vectors_count = g_store->size();
-                        clusters_count = g_ivf->num_clusters();
-                    } catch (const std::exception& e) {
-                        send_line(client_fd, std::string("ERR ") + e.what());
-                        break;
-                    }
-                }
-                
-                std::ostringstream oss;
-                oss << "vectors : " << vectors_count << "\n"
-                    << "clusters : " << clusters_count << "\n"
-                    << "iterations : " << std::stoi(summary.substr(summary.find("iterations=") + 11)) << "\n"
-                    << std::fixed << std::setprecision(3)
-                    << "done in " << build_time_s << " s .";
-                
-                send_line(client_fd, oss.str());
-                send_line(client_fd, "OK");
-                break;
+    send_line(client_fd, "Building IVF index ...");
+    
+    int vectors_count = 0;
+    int clusters_count = 0;
+    int iterations = 0;
+    double build_time_s = 0.0;
+    
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        try {
+            auto t_start = std::chrono::high_resolution_clock::now();
+            std::string summary = g_ivf->build(*g_store);
+            auto t_end = std::chrono::high_resolution_clock::now();
+            
+            build_time_s = std::chrono::duration<double>(t_end - t_start).count();
+            vectors_count = g_store->size();
+            clusters_count = g_ivf->num_clusters();
+            
+            size_t iter_pos = summary.find("iterations=");
+            if (iter_pos != std::string::npos) {
+                iterations = std::stoi(summary.substr(iter_pos + 11));
             }
+        } catch (const std::exception& e) {
+            send_line(client_fd, "ERR");
+            break;
+        }
+    }
+    
+    send_line(client_fd, std::string("vectors : ") + std::to_string(vectors_count));
+    send_line(client_fd, std::string("clusters : ") + std::to_string(clusters_count));
+    send_line(client_fd, std::string("iterations : ") + std::to_string(iterations));
+    
+    std::ostringstream time_str;
+    time_str << std::fixed << std::setprecision(3) << "done in " << build_time_s << " s .";
+    send_line(client_fd, time_str.str());
+    
+    send_line(client_fd, "OK");
+    break;
+}
 
             case CommandType::SEARCH: {
                 if (cmd.method == SearchMethod::BRUTE) {
@@ -168,10 +178,9 @@ static void handle_client(int client_fd, std::string peer_addr) {
                         results = g_store->search_brute(cmd.floats, cmd.k);
                     }
                     
-                    // Output each result: id distance v_1 v_2 ... v_D
                     for (const auto& r : results) {
                         std::ostringstream row;
-                        row << r.id << " " << std::fixed << std::setprecision(2) << r.distance;
+                        row << std::fixed << std::setprecision(2) << r.id << " " << r.distance;
                         
                         const float* vec = nullptr;
                         {
@@ -198,7 +207,6 @@ static void handle_client(int client_fd, std::string peer_addr) {
                     send_line(client_fd, summary.str());
                     
                 } else {
-                    // IVF search
                     if (!g_ivf->is_built()) {
                         send_line(client_fd, "ERR");
                         break;
@@ -213,10 +221,9 @@ static void handle_client(int client_fd, std::string peer_addr) {
                         break;
                     }
                     
-                    // Output each result: id distance v_1 v_2 ... v_D
                     for (const auto& r : results) {
                         std::ostringstream row;
-                        row << r.id << " " << std::fixed << std::setprecision(2) << r.distance;
+                        row << std::fixed << std::setprecision(2) << r.id << " " << r.distance;
                         
                         const float* vec = nullptr;
                         {
